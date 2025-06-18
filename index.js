@@ -3,14 +3,22 @@ const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
 
+// Parse command line arguments
+const args = process.argv.slice(2)
+const usePairCode = args[0] === 'pair' && args[1]
+const pairPhoneNumber = usePairCode ? args[1] : null
+
 // Global flag to track pairing across reconnects
-let globalPairingRequested = false;
+let globalPairingRequested = false
 
-// ... (args parsing and cleanup code remains the same)
+// Clean up any old credentials if starting fresh with pair mode
+if (usePairCode && fs.existsSync('./auth_info_baileys')) {
+  fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
+}
 
-async function startSock() { // Remove parameter
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
-  const sock = makeWASocket({ 
+async function startSock() {
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys')
+  const sock = makeWASocket({
     auth: state,
     printQRInTerminal: !usePairCode // Auto-print QR if not pairing
   })
@@ -82,10 +90,10 @@ async function startSock() { // Remove parameter
   })
 }
 
-// Start logic remains the same
+// Start logic
 if (usePairCode) {
-  if (!/^\d+$/.test(pairPhoneNumber)) {
-    console.error('Invalid number. Use digits only (e.g., 1234567890)')
+  if (!pairPhoneNumber || !/^\d+$/.test(pairPhoneNumber)) {
+    console.error('Invalid phone number. Must be digits only (E.164 format without +). Example: 1234567890')
     process.exit(1)
   }
   startSock()
