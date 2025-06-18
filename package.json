@@ -9,6 +9,8 @@
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.18",
     "qrcode": "^1.5.4",
+    "pino":"^9.7.0",
+    "pino-pretty":"^13.0.0",
     "@hapi/boom": "^10.0.1"
   }
 }
