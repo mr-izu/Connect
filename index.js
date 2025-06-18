@@ -2,6 +2,7 @@ const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whis
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
+const pino = require('pino') // Add Pino logger
 
 // Parse command line arguments
 const args = process.argv.slice(2)
@@ -12,16 +13,25 @@ const pairPhoneNumber = usePairCode ? args[1] : null
 let globalPairingRequested = false
 
 // Clean up any old credentials if starting fresh with pair mode
-if (usePairCode && fs.existsSync('./auth_info')) {
+if (usePairCode && fs.existsSync('./auth_info_baileys')) {
   fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
 }
+
+// Create a proper Pino logger instance
+const logger = pino({
+  level: 'silent',
+  transport: {
+    target: 'pino-pretty',
+    options: { colorize: true }
+  }
+})
 
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys')
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: !usePairCode,
-    logger: { level: 'silent' } // Reduce log noise
+    logger: logger // Use the proper logger instance
   })
 
   sock.ev.on('creds.update', saveCreds)
