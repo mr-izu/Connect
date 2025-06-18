@@ -12,7 +12,7 @@ const pairPhoneNumber = usePairCode ? args[1] : null
 let globalPairingRequested = false
 
 // Clean up any old credentials if starting fresh with pair mode
-if (usePairCode && fs.existsSync('./auth_info_baileys')) {
+if (usePairCode && fs.existsSync('./auth_info')) {
   fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
 }
 
@@ -20,7 +20,8 @@ async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys')
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: !usePairCode // Auto-print QR if not pairing
+    printQRInTerminal: !usePairCode,
+    logger: { level: 'silent' } // Reduce log noise
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -42,10 +43,11 @@ async function startSock() {
     ) {
       globalPairingRequested = true // Prevent future requests
       try {
-        await new Promise(r => setTimeout(r, 1500))
+        // Wait a bit longer for the connection to stabilize
+        await new Promise(r => setTimeout(r, 3000))
         const code = await sock.requestPairingCode(pairPhoneNumber)
-        console.log('Pairing code for', pairPhoneNumber, ':', code)
-        console.log('Enter this code on your WhatsApp (phone number must not be linked elsewhere).')
+        console.log('\nPairing code for', pairPhoneNumber, ':', code)
+        console.log('Enter this code on your WhatsApp within 2 minutes (phone number must not be linked elsewhere).\n')
       } catch (err) {
         console.error('Pairing failed:', err.message)
       }
@@ -53,30 +55,36 @@ async function startSock() {
 
     if (connection === 'close') {
       const reason = lastDisconnect?.error
-      const shouldReconnect = reason instanceof Boom && 
-        reason.output?.statusCode === DisconnectReason.restartRequired
+      let shouldReconnect = false
 
-      // Handle specific pairing errors
-      if (reason?.output?.statusCode === DisconnectReason.unauthorized) {
-        console.error(
-          'Authorization failed:\n' +
-          '- Number must NOT be linked elsewhere\n' +
-          '- Valid WhatsApp account required\n' +
-          '- Delete "auth_info_baileys" and retry'
-        )
-        return // Don't reconnect
+      if (reason instanceof Boom) {
+        const statusCode = reason.output?.statusCode
+        
+        // Special handling for pairing mode
+        if (usePairCode) {
+          // Always reconnect in pairing mode except for invalid number errors
+          shouldReconnect = statusCode !== DisconnectReason.badSession && 
+                           statusCode !== DisconnectReason.invalidSession
+          
+          if (statusCode === DisconnectReason.unauthorized) {
+            console.log('Waiting for pairing code confirmation...')
+          }
+        } else {
+          // Standard reconnect logic for QR mode
+          shouldReconnect = statusCode === DisconnectReason.restartRequired
+        }
       }
 
-      console.log('Connection closed:', reason?.output?.payload || reason || 'unknown')
-      
       if (shouldReconnect) {
-        console.log('Restart required, reconnecting...')
-        setTimeout(startSock, 1000) // Reconnect without pairing flow
+        console.log('Reconnecting...')
+        setTimeout(startSock, 2000)
+      } else {
+        console.log('Connection closed:', reason?.output?.payload || reason || 'unknown')
       }
     }
 
     if (connection === 'open') {
-      console.log('Successfully connected to WhatsApp!')
+      console.log('\nSuccessfully connected to WhatsApp!')
       
       try {
         let jid
@@ -99,8 +107,8 @@ async function startSock() {
 
 // Start logic
 if (usePairCode) {
-  if (!pairPhoneNumber || !/^\d+$/.test(pairPhoneNumber)) {
-    console.error('Invalid phone number. Must be digits only (E.164 format without +). Example: 1234567890')
+  if (!pairPhoneNumber || !/^\d{10,15}$/.test(pairPhoneNumber)) {
+    console.error('Invalid phone number. Must be 10-15 digits (E.164 format without +). Example: 1234567890')
     process.exit(1)
   }
   startSock()
