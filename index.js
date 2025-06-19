@@ -1,14 +1,18 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
+const { makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const { Client } = require('pg')
 const crypto = require('crypto')
+const pino = require('pino')
 
-// Generate session password with prefix
-function generateSessionPassword() {
-  const randomString = crypto.randomBytes(10).toString('hex')
-  return `IzumieConsole~${randomString}`
-}
+// Create proper Pino logger
+const logger = pino({
+  level: 'silent',
+  transport: {
+    target: 'pino-pretty',
+    options: { colorize: true }
+  }
+})
 
 // PostgreSQL client setup
 const pgClient = new Client({
@@ -25,26 +29,31 @@ async function usePostgresAuthState(sessionPassword) {
   let creds = null
   let keys = {}
 
-  // Load from PostgreSQL
-  const res = await pgClient.query(
-    'SELECT state FROM sessions WHERE session_password = $1',
-    [sessionPassword]
-  )
-  
-  if (res.rows.length > 0) {
-    ({ creds, keys } = res.rows[0].state)
+  // Load from PostgreSQL if session exists
+  if (sessionPassword) {
+    const res = await pgClient.query(
+      'SELECT state FROM sessions WHERE session_password = $1',
+      [sessionPassword]
+    )
+    
+    if (res.rows.length > 0) {
+      ({ creds, keys } = res.rows[0].state)
+      console.log(`Loaded existing session: ${sessionPassword}`)
+    }
   }
 
   // Save to PostgreSQL
   const saveCreds = async (newCreds) => {
     creds = newCreds
-    await pgClient.query(
-      `INSERT INTO sessions (session_password, state)
-       VALUES ($1, $2)
-       ON CONFLICT (session_password)
-       DO UPDATE SET state = $2`,
-      [sessionPassword, { creds, keys }]
-    )
+    if (sessionPassword) {
+      await pgClient.query(
+        `INSERT INTO sessions (session_password, state)
+         VALUES ($1, $2)
+         ON CONFLICT (session_password)
+         DO UPDATE SET state = $2`,
+        [sessionPassword, { creds, keys }]
+      )
+    }
   }
 
   return {
@@ -64,22 +73,27 @@ async function usePostgresAuthState(sessionPassword) {
   }
 }
 
+// Generate session password with prefix
+function generateSessionPassword() {
+  const randomString = crypto.randomBytes(10).toString('hex')
+  return `IzumieConsole~${randomString}`
+}
+
 // Parse command line arguments
 const args = process.argv.slice(2)
 const usePairCode = args[0] === 'pair' && args[1]
 const pairPhoneNumber = usePairCode ? args[1] : null
-const sessionPassword = args[2] || generateSessionPassword()
+const sessionPassword = args[2] || null // Don't generate yet
 
-// Log session password
-console.log(`Session Password: ${sessionPassword}`)
 globalPairingRequested = false
 
 async function startSock() {
-  const { state, saveCreds } = await usePostgresAuthState(sessionPassword)
+  // Start without session password
+  let { state, saveCreds } = await usePostgresAuthState(sessionPassword)
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: !usePairCode,
-    logger: { level: 'silent' } // Disable verbose logging
+    logger: logger // Use the proper logger instance
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -132,7 +146,22 @@ async function startSock() {
     }
 
     if (connection === 'open') {
+      // Only generate session password AFTER successful connection
+      const finalSessionPassword = sessionPassword || generateSessionPassword()
+      
+      if (!sessionPassword) {
+        // Update auth state with new session password
+        const newState = await usePostgresAuthState(finalSessionPassword)
+        state = newState.state
+        saveCreds = newState.saveCreds
+        
+        // Save credentials with new session password
+        await saveCreds(sock.authState.creds)
+      }
+
       console.log('\nSuccessfully connected to WhatsApp!')
+      console.log(`Session Password: ${finalSessionPassword}`)
+      
       try {
         const jid = usePairCode 
           ? pairPhoneNumber.replace(/\D/g, '') + '@s.whatsapp.net'
