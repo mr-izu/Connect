@@ -1,12 +1,71 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
+const { makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const { Client } = require('pg')
-const crypto = require('crypto')
-const fs = require('fs')
 const pino = require('pino')
 
-// Create proper Pino logger
+// Parse command line arguments
+const args = process.argv.slice(2)
+const usePairCode = args[0] === 'pair' && args[1]
+const pairPhoneNumber = usePairCode ? args[1] : null
+const sessionId = args[2] || 'IzumieConsole~DefaultSession'
+
+// Global flag to track pairing across reconnects
+let globalPairingRequested = false
+
+// Setup PostgreSQL client
+const pgClient = new Client({
+  connectionString: process.env.DATABASE_URL || 'postgres://user:password@localhost:5432/yourdb'
+})
+pgClient.connect()
+
+const pgTable = 'auth_state'
+
+// PostgreSQL session handler
+async function loadData(id) {
+  const res = await pgClient.query(`SELECT data FROM ${pgTable} WHERE id = $1`, [id])
+  return res.rows[0]?.data || null
+}
+
+async function saveData(id, data) {
+  await pgClient.query(`
+    INSERT INTO ${pgTable} (id, data)
+    VALUES ($1, $2)
+    ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
+  `, [id, data])
+}
+
+async function usePostgresAuthState(id) {
+  let creds = await loadData(`${id}:creds`) || {}
+  let keys = await loadData(`${id}:keys`) || {}
+
+  const saveCreds = async () => {
+    await saveData(`${id}:creds`, creds)
+  }
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) =>
+          Object.fromEntries(
+            ids.map(id => [id, keys?.[`${type}:${id}`]]).filter(([, v]) => v)
+          ),
+        set: async data => {
+          for (const category in data) {
+            for (const id in data[category]) {
+              keys[`${category}:${id}`] = data[category][id]
+            }
+          }
+          await saveData(`${sessionId}:keys`, keys)
+        }
+      }
+    },
+    saveCreds
+  }
+}
+
+// Logger
 const logger = pino({
   level: 'silent',
   transport: {
@@ -15,48 +74,10 @@ const logger = pino({
   }
 })
 
-// PostgreSQL client setup
-const pgClient = new Client({
-  connectionString: 'postgresql://neondb_owner:npg_Nlo0HYIwJD3T@ep-royal-lake-aa8hb1m2-pooler.westus3.azure.neon.tech/neondb?sslmode=require'
-})
-
-// Connect to PostgreSQL
-pgClient.connect()
-  .then(() => console.log('Connected to PostgreSQL'))
-  .catch(err => console.error('PostgreSQL connection error', err))
-
-// Generate session ID with prefix
-function generateSessionId() {
-  const randomString = crypto.randomBytes(10).toString('hex')
-  return `IzumieConsole~${randomString}`
-}
-
-// Function to store session in PostgreSQL
-async function storeSession(sessionId, sessionData) {
-  try {
-    await pgClient.query(
-      `INSERT INTO sessions (session_id, session_data)
-       VALUES ($1, $2)
-       ON CONFLICT (session_id)
-       DO UPDATE SET session_data = $2`,
-      [sessionId, sessionData]
-    )
-    console.log(`Session stored with ID: ${sessionId}`)
-  } catch (err) {
-    console.error('Error storing session:', err.message)
-  }
-}
-
-// Parse command line arguments
-const args = process.argv.slice(2)
-const usePairCode = args[0] === 'pair' && args[1]
-const pairPhoneNumber = usePairCode ? args[1] : null
-const sessionId = args[2] || null
-
-globalPairingRequested = false
-
+// Start Socket
 async function startSock() {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys')
+  const { state, saveCreds } = await usePostgresAuthState(sessionId)
+
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: !usePairCode,
@@ -68,20 +89,22 @@ async function startSock() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
-    // QR code flow
     if (qr && !usePairCode) {
       console.log('Scan this QR code with your WhatsApp app:')
       console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
     }
 
-    // Pair code flow
-    if (usePairCode && !globalPairingRequested && (connection === 'connecting' || qr)) {
+    if (
+      usePairCode &&
+      !globalPairingRequested &&
+      (connection === 'connecting' || qr)
+    ) {
       globalPairingRequested = true
       try {
         await new Promise(r => setTimeout(r, 3000))
         const code = await sock.requestPairingCode(pairPhoneNumber)
         console.log('\nPairing code for', pairPhoneNumber, ':', code)
-        console.log('Enter this code on your WhatsApp within 2 minutes\n')
+        console.log('Enter this code on your WhatsApp within 2 minutes (phone number must not be linked elsewhere).\n')
       } catch (err) {
         console.error('Pairing failed:', err.message)
       }
@@ -93,11 +116,13 @@ async function startSock() {
 
       if (reason instanceof Boom) {
         const statusCode = reason.output?.statusCode
+
         if (usePairCode) {
           shouldReconnect = statusCode !== DisconnectReason.badSession && 
-                           statusCode !== DisconnectReason.invalidSession
+                            statusCode !== DisconnectReason.invalidSession
+
           if (statusCode === DisconnectReason.unauthorized) {
-            console.log('Waiting for pairing confirmation...')
+            console.log('Waiting for pairing code confirmation...')
           }
         } else {
           shouldReconnect = statusCode === DisconnectReason.restartRequired
@@ -114,48 +139,27 @@ async function startSock() {
 
     if (connection === 'open') {
       console.log('\nSuccessfully connected to WhatsApp!')
-      
       try {
-        const jid = usePairCode 
+        let jid = usePairCode
           ? pairPhoneNumber.replace(/\D/g, '') + '@s.whatsapp.net'
           : sock.user.id
-          
-        await sock.sendMessage(jid, { text: 'Connected Success' })
-        console.log('Sent confirmation to', jid.split('@')[0])
-        
-        // Store session ONLY AFTER successful connection
-        if (!sessionId) {
-          const newSessionId = generateSessionId()
-          console.log(`Session ID: ${newSessionId}`)
-          
-          // Read the entire auth directory
-          const authDir = './auth_info_baileys'
-          const files = fs.readdirSync(authDir)
-          const sessionData = {}
-          
-          for (const file of files) {
-            sessionData[file] = fs.readFileSync(`${authDir}/${file}`, 'utf8')
-          }
-          
-          // Store in PostgreSQL
-          await storeSession(newSessionId, JSON.stringify(sessionData))
-        }
+
+        await sock.sendMessage(jid, { text: `Your Session ID: ${sessionId}` })
+        console.log('Sent session ID message to', jid.split('@')[0])
       } catch (err) {
-        console.error('Failed to send confirmation:', err.message)
+        console.error('Failed to send connected message:', err.message)
       }
     }
   })
 }
 
-// Validate arguments and start
+// Entry Point
 if (usePairCode) {
   if (!pairPhoneNumber || !/^\d{10,15}$/.test(pairPhoneNumber)) {
-    console.error('Invalid phone number. Must be 10-15 digits (E.164 format without +)')
+    console.error('Invalid phone number. Must be 10-15 digits (E.164 format without +). Example: 1234567890')
     process.exit(1)
   }
+  startSock()
+} else {
+  startSock()
 }
-startSock()
-
-// Close DB connection on exit
-process.on('exit', () => pgClient.end())
-process.on('SIGINT', () => process.exit())
