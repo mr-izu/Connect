@@ -4,6 +4,7 @@ const { Boom } = require('@hapi/boom')
 const fs = require('fs')
 const { Client } = require('pg')
 const crypto = require('crypto')
+const pino = require('pino')
 
 // PostgreSQL connection string
 const DB_URL = 'postgresql://neondb_owner:npg_Nlo0HYIwJD3T@ep-royal-lake-aa8hb1m2-pooler.westus3.azure.neon.tech/neondb?sslmode=require'
@@ -17,6 +18,15 @@ const pairPhoneNumber = usePairCode ? args[1] : null
 let sessionId = null
 let globalPairingRequested = false
 let sessionCreated = false
+
+// Create proper Pino logger
+const logger = pino({
+  level: 'silent',
+  transport: {
+    target: 'pino-pretty',
+    options: { colorize: true }
+  }
+})
 
 // Generate session ID with pattern: IzumieConsole~<random_string>
 function generateSessionId() {
@@ -43,8 +53,8 @@ async function usePostgresAuthState() {
   return {
     client,
     state: {
-      creds: null,
-      keys: null
+      creds: { },
+      keys: { }
     },
     saveCreds: async () => {
       if (sessionId && sessionCreated) {
@@ -85,8 +95,9 @@ async function startSock() {
   
   const sock = makeWASocket({
     auth: state,
-    printQRInTerminal: !usePairCode,
-    logger: { level: 'silent' }
+    logger: logger, // Use proper Pino logger
+    shouldIgnoreJid: () => true, // Reduce noise
+    syncFullHistory: false // Reduce load
   })
 
   sock.ev.on('creds.update', () => {
@@ -97,10 +108,13 @@ async function startSock() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
-    // QR code flow
+    // QR code flow - manual handling
     if (qr && !usePairCode) {
       console.log('Scan this QR code with your WhatsApp app:')
-      console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
+      QRCode.toString(qr, { type: 'terminal', small: true }, (err, url) => {
+        if (err) throw err
+        console.log(url)
+      })
     }
 
     // Pair code flow
@@ -168,7 +182,7 @@ async function startSock() {
           jid = sock.user.id
         }
         
-        // Send session ID instead of "Connected Success"
+        // Send session ID message
         const message = `This is your Session ID: ${sessionId}\nKeep it safe, from Console`
         await sock.sendMessage(jid, { text: message })
         console.log(`Sent session ID ${sessionId} to`, jid.split('@')[0])
