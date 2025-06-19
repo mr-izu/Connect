@@ -1,7 +1,6 @@
-const { makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys')
+const { makeWASocket, DisconnectReason, initAuthCreds } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
-const fs = require('fs')
 const { Client } = require('pg')
 const crypto = require('crypto')
 const pino = require('pino')
@@ -17,7 +16,6 @@ const pairPhoneNumber = usePairCode ? args[1] : null
 // Global session tracking
 let sessionId = null
 let globalPairingRequested = false
-let sessionCreated = false
 
 // Create proper Pino logger
 const logger = pino({
@@ -39,19 +37,8 @@ async function usePostgresAuthState() {
   const client = new Client({ connectionString: DB_URL })
   await client.connect()
   
-  // Create sessions table if not exists
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS whatsapp_sessions (
-      session_id TEXT PRIMARY KEY,
-      phone_number TEXT,
-      session_data JSONB NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW(),
-      connected_at TIMESTAMP
-    )
-  `)
-  
   const state = {
-    creds: {},
+    creds: initAuthCreds(),
     keys: {}
   }
   
@@ -59,11 +46,11 @@ async function usePostgresAuthState() {
     client,
     state,
     saveCreds: async () => {
-      if (sessionId && sessionCreated) {
+      if (sessionId) {
         try {
           await client.query(`
-            INSERT INTO whatsapp_sessions (session_id, phone_number, session_data)
-            VALUES ($1, $2, $3)
+            INSERT INTO whatsapp_sessions (session_id, phone_number, session_data, connected_at)
+            VALUES ($1, $2, $3, NOW())
             ON CONFLICT (session_id) 
             DO UPDATE SET 
               session_data = EXCLUDED.session_data,
@@ -74,7 +61,7 @@ async function usePostgresAuthState() {
             JSON.stringify({ creds: state.creds, keys: state.keys })
           ])
         } catch (err) {
-          console.error('Failed to save session to database:', err.message)
+          console.error('Failed to save session:', err.message)
         }
       }
     },
@@ -83,25 +70,20 @@ async function usePostgresAuthState() {
         try {
           await client.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [sessionId])
         } catch (err) {
-          console.error('Failed to remove session from database:', err.message)
+          console.error('Failed to remove session:', err.message)
         }
       }
     }
   }
 }
 
-// Clean up old sessions if starting fresh
-if (usePairCode && fs.existsSync('./auth_info_baileys')) {
-  fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
-}
-
 async function startSock() {
   // Generate session ID
   sessionId = generateSessionId()
+  console.log(`Starting session: ${sessionId}`)
   
   // Initialize PostgreSQL auth
   const { client, state, saveCreds, removeCreds } = await usePostgresAuthState()
-  sessionCreated = true
   
   const sock = makeWASocket({
     auth: {
@@ -110,7 +92,11 @@ async function startSock() {
     },
     logger: logger,
     shouldIgnoreJid: () => true,
-    syncFullHistory: false
+    syncFullHistory: false,
+    connectTimeoutMs: 10000, // Faster connection timeout
+    keepAliveIntervalMs: 15000, // Keep connection alive
+    maxIdleTimeMs: 30000, // Faster reconnection
+    browser: ["Ubuntu", "Chrome", "22.04.4"] // Standard browser info
   })
 
   // Update state when credentials change
@@ -139,7 +125,6 @@ async function startSock() {
     ) {
       globalPairingRequested = true
       try {
-        await new Promise(r => setTimeout(r, 3000))
         const code = await sock.requestPairingCode(pairPhoneNumber)
         console.log('\nPairing code for', pairPhoneNumber, ':', code)
         console.log('Enter this code on your WhatsApp within 2 minutes')
@@ -170,7 +155,7 @@ async function startSock() {
 
       if (shouldReconnect) {
         console.log('Reconnecting...')
-        setTimeout(startSock, 2000)
+        setTimeout(startSock, 1000)
       } else {
         console.log('Connection closed:', reason?.output?.payload || reason || 'unknown')
         await removeCreds()
@@ -198,7 +183,7 @@ async function startSock() {
         // Send session ID message
         const message = `This is your Session ID: ${sessionId}\nKeep it safe, from Console`
         await sock.sendMessage(jid, { text: message })
-        console.log(`Sent session ID ${sessionId} to`, jid.split('@')[0])
+        console.log(`Sent session ID to ${jid.split('@')[0]}`)
       } catch (err) {
         console.error('Failed to send session ID:', err.message)
       } finally {
