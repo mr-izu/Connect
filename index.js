@@ -1,4 +1,4 @@
-const { makeWASocket, DisconnectReason, initAuthCreds } = require('@whiskeysockets/baileys')
+const { makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const { Client } = require('pg')
@@ -13,18 +13,11 @@ const args = process.argv.slice(2)
 const usePairCode = args[0] === 'pair' && args[1]
 const pairPhoneNumber = usePairCode ? args[1] : null
 
-// Global session tracking
-let sessionId = null
+// Global flag to track pairing
 let globalPairingRequested = false
 
 // Create proper Pino logger
-const logger = pino({
-  level: 'silent',
-  transport: {
-    target: 'pino-pretty',
-    options: { colorize: true }
-  }
-})
+const logger = pino({ level: 'silent' })
 
 // Generate session ID with pattern: IzumieConsole~<random_string>
 function generateSessionId() {
@@ -32,102 +25,46 @@ function generateSessionId() {
   return `IzumieConsole~${randomString}`
 }
 
-// PostgreSQL session manager
-async function usePostgresAuthState() {
+// Save session to database ONLY after successful connection
+async function saveSessionToDatabase(sessionId, phoneNumber, sessionData) {
   const client = new Client({ connectionString: DB_URL })
   await client.connect()
-  
-  const state = {
-    creds: initAuthCreds(),
-    keys: {}
-  }
-  
-  return {
-    client,
-    state,
-    saveCreds: async () => {
-      if (sessionId) {
-        try {
-          await client.query(`
-            INSERT INTO whatsapp_sessions (session_id, phone_number, session_data, connected_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (session_id) 
-            DO UPDATE SET 
-              session_data = EXCLUDED.session_data,
-              connected_at = NOW()
-          `, [
-            sessionId,
-            pairPhoneNumber || null,
-            JSON.stringify({ creds: state.creds, keys: state.keys })
-          ])
-        } catch (err) {
-          console.error('Failed to save session:', err.message)
-        }
-      }
-    },
-    removeCreds: async () => {
-      if (sessionId) {
-        try {
-          await client.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [sessionId])
-        } catch (err) {
-          console.error('Failed to remove session:', err.message)
-        }
-      }
-    }
+  try {
+    await client.query(`
+      INSERT INTO whatsapp_sessions (session_id, phone_number, session_data, connected_at)
+      VALUES ($1, $2, $3, NOW())
+    `, [sessionId, phoneNumber, JSON.stringify(sessionData)])
+    console.log(`Session saved to database: ${sessionId}`)
+  } catch (err) {
+    console.error('Failed to save session:', err.message)
+  } finally {
+    await client.end()
   }
 }
 
 async function startSock() {
-  // Generate session ID
-  sessionId = generateSessionId()
-  console.log(`Starting session: ${sessionId}`)
-  
-  // Initialize PostgreSQL auth
-  const { client, state, saveCreds, removeCreds } = await usePostgresAuthState()
-  
   const sock = makeWASocket({
-    auth: {
-      creds: state.creds,
-      keys: state.keys
-    },
     logger: logger,
-    shouldIgnoreJid: () => true,
-    syncFullHistory: false,
-    connectTimeoutMs: 10000, // Faster connection timeout
-    keepAliveIntervalMs: 15000, // Keep connection alive
-    maxIdleTimeMs: 30000, // Faster reconnection
-    browser: ["Ubuntu", "Chrome", "22.04.4"] // Standard browser info
-  })
-
-  // Update state when credentials change
-  sock.ev.on('creds.update', (creds) => {
-    state.creds = creds
-    saveCreds()
+    connectTimeoutMs: 10000,
+    browser: ["Ubuntu", "Chrome", "22.04.4"]
   })
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update
 
-    // QR code flow - manual handling
+    // QR code flow
     if (qr && !usePairCode) {
       console.log('Scan this QR code with your WhatsApp app:')
-      QRCode.toString(qr, { type: 'terminal', small: true }, (err, url) => {
-        if (err) throw err
-        console.log(url)
-      })
+      console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
     }
 
     // Pair code flow
-    if (
-      usePairCode &&
-      !globalPairingRequested &&
-      (connection === 'connecting' || qr)
-    ) {
+    if (usePairCode && !globalPairingRequested && connection === 'connecting') {
       globalPairingRequested = true
       try {
         const code = await sock.requestPairingCode(pairPhoneNumber)
         console.log('\nPairing code for', pairPhoneNumber, ':', code)
-        console.log('Enter this code on your WhatsApp within 2 minutes')
+        console.log('Enter this code on your WhatsApp')
       } catch (err) {
         console.error('Pairing failed:', err.message)
       }
@@ -139,55 +76,41 @@ async function startSock() {
 
       if (reason instanceof Boom) {
         const statusCode = reason.output?.statusCode
-        
-        // Special handling for pairing mode
-        if (usePairCode) {
-          shouldReconnect = statusCode !== DisconnectReason.badSession && 
-                           statusCode !== DisconnectReason.invalidSession
-          
-          if (statusCode === DisconnectReason.unauthorized) {
-            console.log('Waiting for pairing code confirmation...')
-          }
-        } else {
-          shouldReconnect = statusCode === DisconnectReason.restartRequired
-        }
+        shouldReconnect = statusCode === DisconnectReason.restartRequired
       }
 
       if (shouldReconnect) {
         console.log('Reconnecting...')
         setTimeout(startSock, 1000)
-      } else {
-        console.log('Connection closed:', reason?.output?.payload || reason || 'unknown')
-        await removeCreds()
-        await client.end()
       }
     }
 
     if (connection === 'open') {
       console.log('\nSuccessfully connected to WhatsApp!')
       
-      // Save session to database
-      state.keys = sock.authState.keys
-      await saveCreds()
+      // Generate session ID AFTER successful connection
+      const sessionId = generateSessionId()
       
+      // Save session to database
+      const sessionData = {
+        creds: sock.authState.creds,
+        keys: sock.authState.keys
+      }
+      
+      const phone = usePairCode ? pairPhoneNumber : sock.user.id.split(':')[0]
+      await saveSessionToDatabase(sessionId, phone, sessionData)
+      
+      // Send session ID to user
       try {
-        let jid
-        if (usePairCode) {
-          // For pair mode: send to provided number
-          jid = pairPhoneNumber.replace(/\D/g, '') + '@s.whatsapp.net'
-        } else {
-          // For QR mode: send to the bot's own number
-          jid = sock.user.id
-        }
+        const jid = usePairCode ? 
+          `${pairPhoneNumber}@s.whatsapp.net` : 
+          sock.user.id
         
-        // Send session ID message
         const message = `This is your Session ID: ${sessionId}\nKeep it safe, from Console`
         await sock.sendMessage(jid, { text: message })
         console.log(`Sent session ID to ${jid.split('@')[0]}`)
       } catch (err) {
         console.error('Failed to send session ID:', err.message)
-      } finally {
-        await client.end()
       }
     }
   })
