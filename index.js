@@ -1,4 +1,4 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
+const { makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
@@ -50,31 +50,41 @@ async function usePostgresAuthState() {
     )
   `)
   
+  const state = {
+    creds: {},
+    keys: {}
+  }
+  
   return {
     client,
-    state: {
-      creds: { },
-      keys: { }
-    },
+    state,
     saveCreds: async () => {
       if (sessionId && sessionCreated) {
-        await client.query(`
-          INSERT INTO whatsapp_sessions (session_id, phone_number, session_data)
-          VALUES ($1, $2, $3)
-          ON CONFLICT (session_id) 
-          DO UPDATE SET 
-            session_data = EXCLUDED.session_data,
-            connected_at = NOW()
-        `, [
-          sessionId,
-          pairPhoneNumber || null,
-          JSON.stringify({ creds: this.state.creds, keys: this.state.keys })
-        ])
+        try {
+          await client.query(`
+            INSERT INTO whatsapp_sessions (session_id, phone_number, session_data)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (session_id) 
+            DO UPDATE SET 
+              session_data = EXCLUDED.session_data,
+              connected_at = NOW()
+          `, [
+            sessionId,
+            pairPhoneNumber || null,
+            JSON.stringify({ creds: state.creds, keys: state.keys })
+          ])
+        } catch (err) {
+          console.error('Failed to save session to database:', err.message)
+        }
       }
     },
     removeCreds: async () => {
       if (sessionId) {
-        await client.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [sessionId])
+        try {
+          await client.query('DELETE FROM whatsapp_sessions WHERE session_id = $1', [sessionId])
+        } catch (err) {
+          console.error('Failed to remove session from database:', err.message)
+        }
       }
     }
   }
@@ -94,14 +104,18 @@ async function startSock() {
   sessionCreated = true
   
   const sock = makeWASocket({
-    auth: state,
-    logger: logger, // Use proper Pino logger
-    shouldIgnoreJid: () => true, // Reduce noise
-    syncFullHistory: false // Reduce load
+    auth: {
+      creds: state.creds,
+      keys: state.keys
+    },
+    logger: logger,
+    shouldIgnoreJid: () => true,
+    syncFullHistory: false
   })
 
-  sock.ev.on('creds.update', () => {
-    state.creds = sock.authState.creds
+  // Update state when credentials change
+  sock.ev.on('creds.update', (creds) => {
+    state.creds = creds
     saveCreds()
   })
 
@@ -168,7 +182,6 @@ async function startSock() {
       console.log('\nSuccessfully connected to WhatsApp!')
       
       // Save session to database
-      state.creds = sock.authState.creds
       state.keys = sock.authState.keys
       await saveCreds()
       
