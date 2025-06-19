@@ -28,8 +28,8 @@ function generateSessionId() {
 // Save session to database ONLY after successful connection
 async function saveSessionToDatabase(sessionId, phoneNumber, sessionData) {
   const client = new Client({ connectionString: DB_URL })
-  await client.connect()
   try {
+    await client.connect()
     await client.query(`
       INSERT INTO whatsapp_sessions (session_id, phone_number, session_data, connected_at)
       VALUES ($1, $2, $3, NOW())
@@ -50,14 +50,18 @@ async function startSock() {
   }
   
   const sock = makeWASocket({
-    auth: authState, // Pass the auth state here
+    auth: authState,
     logger: logger,
-    connectTimeoutMs: 10000,
-    browser: ["Ubuntu", "Chrome", "22.04.4"]
+    connectTimeoutMs: 30000, // Increased timeout for pairing
+    browser: ["Ubuntu", "Chrome", "22.04.4"],
+    keepAliveIntervalMs: 10000, // Keep connection alive
+    maxIdleTimeMs: 30000, // Allow more idle time
+    printQRInTerminal: !usePairCode // Enable QR display if needed
   })
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
+    const { connection, lastDisconnect, qr, isNewLogin } = update
+    console.log('Connection update:', connection)
 
     // QR code flow
     if (qr && !usePairCode) {
@@ -65,30 +69,34 @@ async function startSock() {
       console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
     }
 
-    // Pair code flow
-    if (usePairCode && !globalPairingRequested && connection === 'connecting') {
+    // Pair code flow - wait until connection is 'connecting' and stable
+    if (usePairCode && !globalPairingRequested && (connection === 'connecting' || connection === 'open')) {
       globalPairingRequested = true
       try {
+        // Wait a moment to ensure connection is ready
+        await new Promise(resolve => setTimeout(resolve, 2000))
+        
         const code = await sock.requestPairingCode(pairPhoneNumber)
         console.log('\nPairing code for', pairPhoneNumber, ':', code)
-        console.log('Enter this code on your WhatsApp')
+        console.log('Enter this code on your WhatsApp within 2 minutes')
       } catch (err) {
         console.error('Pairing failed:', err.message)
+        // Reset flag to allow retry
+        globalPairingRequested = false
       }
     }
 
     if (connection === 'close') {
       const reason = lastDisconnect?.error
-      let shouldReconnect = false
-
+      console.log('Connection closed:', reason?.output?.payload || reason || 'unknown')
+      
+      // Reconnect if it's a restartable error
       if (reason instanceof Boom) {
         const statusCode = reason.output?.statusCode
-        shouldReconnect = statusCode === DisconnectReason.restartRequired
-      }
-
-      if (shouldReconnect) {
-        console.log('Reconnecting...')
-        setTimeout(startSock, 1000)
+        if (statusCode === DisconnectReason.restartRequired) {
+          console.log('Reconnecting...')
+          setTimeout(startSock, 2000)
+        }
       }
     }
 
