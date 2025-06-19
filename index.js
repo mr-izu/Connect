@@ -1,4 +1,4 @@
-const { makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys')
+const { makeWASocket, DisconnectReason, initAuthCreds } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const { Client } = require('pg')
@@ -43,7 +43,14 @@ async function saveSessionToDatabase(sessionId, phoneNumber, sessionData) {
 }
 
 async function startSock() {
+  // Create initial empty auth state
+  const authState = {
+    creds: initAuthCreds(),
+    keys: {}
+  }
+  
   const sock = makeWASocket({
+    auth: authState, // Pass the auth state here
     logger: logger,
     connectTimeoutMs: 10000,
     browser: ["Ubuntu", "Chrome", "22.04.4"]
@@ -93,8 +100,8 @@ async function startSock() {
       
       // Save session to database
       const sessionData = {
-        creds: sock.authState.creds,
-        keys: sock.authState.keys
+        creds: authState.creds,
+        keys: authState.keys
       }
       
       const phone = usePairCode ? pairPhoneNumber : sock.user.id.split(':')[0]
