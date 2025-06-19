@@ -28,32 +28,63 @@ pgClient.connect()
 async function usePostgresAuthState(sessionPassword) {
   let creds = null
   let keys = {}
+  let currentSessionPassword = sessionPassword
 
   // Load from PostgreSQL if session exists
-  if (sessionPassword) {
-    const res = await pgClient.query(
-      'SELECT state FROM sessions WHERE session_password = $1',
-      [sessionPassword]
-    )
-    
-    if (res.rows.length > 0) {
-      ({ creds, keys } = res.rows[0].state)
-      console.log(`Loaded existing session: ${sessionPassword}`)
+  if (currentSessionPassword) {
+    try {
+      const res = await pgClient.query(
+        'SELECT state FROM sessions WHERE session_password = $1',
+        [currentSessionPassword]
+      )
+      
+      if (res.rows.length > 0 && res.rows[0].state) {
+        ({ creds, keys } = res.rows[0].state)
+        console.log(`Loaded existing session: ${currentSessionPassword}`)
+      } else {
+        console.log(`No existing session found for: ${currentSessionPassword}`)
+      }
+    } catch (err) {
+      console.error('Error loading session:', err.message)
+    }
+  }
+
+  // Initialize with empty credentials if null
+  if (!creds) {
+    creds = {
+      noiseKey: null,
+      signedIdentityKey: null,
+      signedPreKey: null,
+      registrationId: null,
+      advSecretKey: null,
+      nextPreKeyId: null,
+      firstPreKeyId: null,
+      serverHasPreKeys: null,
+      me: null
     }
   }
 
   // Save to PostgreSQL
   const saveCreds = async (newCreds) => {
     creds = newCreds
-    if (sessionPassword) {
-      await pgClient.query(
-        `INSERT INTO sessions (session_password, state)
-         VALUES ($1, $2)
-         ON CONFLICT (session_password)
-         DO UPDATE SET state = $2`,
-        [sessionPassword, { creds, keys }]
-      )
+    if (currentSessionPassword) {
+      try {
+        await pgClient.query(
+          `INSERT INTO sessions (session_password, state)
+           VALUES ($1, $2)
+           ON CONFLICT (session_password)
+           DO UPDATE SET state = $2`,
+          [currentSessionPassword, { creds, keys }]
+        )
+      } catch (err) {
+        console.error('Error saving credentials:', err.message)
+      }
     }
+  }
+
+  // Function to set session password after connection
+  const setSessionPassword = (newPassword) => {
+    currentSessionPassword = newPassword
   }
 
   return {
@@ -69,7 +100,8 @@ async function usePostgresAuthState(sessionPassword) {
         }
       }
     },
-    saveCreds
+    saveCreds,
+    setSessionPassword
   }
 }
 
@@ -88,12 +120,14 @@ const sessionPassword = args[2] || null // Don't generate yet
 globalPairingRequested = false
 
 async function startSock() {
-  // Start without session password
-  let { state, saveCreds } = await usePostgresAuthState(sessionPassword)
+  // Create auth state with proper initialization
+  const authState = await usePostgresAuthState(sessionPassword)
+  const { state, saveCreds, setSessionPassword } = authState
+  
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: !usePairCode,
-    logger: logger // Use the proper logger instance
+    logger: logger
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -147,20 +181,15 @@ async function startSock() {
 
     if (connection === 'open') {
       // Only generate session password AFTER successful connection
-      const finalSessionPassword = sessionPassword || generateSessionPassword()
-      
       if (!sessionPassword) {
-        // Update auth state with new session password
-        const newState = await usePostgresAuthState(finalSessionPassword)
-        state = newState.state
-        saveCreds = newState.saveCreds
-        
-        // Save credentials with new session password
+        const newSessionPassword = generateSessionPassword()
+        setSessionPassword(newSessionPassword)
         await saveCreds(sock.authState.creds)
+        console.log('\nSuccessfully connected to WhatsApp!')
+        console.log(`Session Password: ${newSessionPassword}`)
+      } else {
+        console.log('\nSuccessfully reconnected to WhatsApp!')
       }
-
-      console.log('\nSuccessfully connected to WhatsApp!')
-      console.log(`Session Password: ${finalSessionPassword}`)
       
       try {
         const jid = usePairCode 
@@ -177,9 +206,11 @@ async function startSock() {
 }
 
 // Validate arguments and start
-if (usePairCode && (!pairPhoneNumber || !/^\d{10,15}$/.test(pairPhoneNumber))) {
-  console.error('Invalid phone number. Must be 10-15 digits (E.164 format without +)')
-  process.exit(1)
+if (usePairCode) {
+  if (!pairPhoneNumber || !/^\d{10,15}$/.test(pairPhoneNumber)) {
+    console.error('Invalid phone number. Must be 10-15 digits (E.164 format without +)')
+    process.exit(1)
+  }
 }
 startSock()
 
