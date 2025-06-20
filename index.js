@@ -1,4 +1,4 @@
-const { makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys')
+const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const { Client } = require('pg')
@@ -49,58 +49,21 @@ async function saveSessionToDB(sessionId, creds, keys) {
   }
 }
 
-async function waitForPairingCode(sock, number) {
-  let retries = 0
-  const maxRetries = 10
-
-  while (retries < maxRetries) {
-    try {
-      const noiseReady = sock.authState?.creds?.noiseKey?.public
-      if (noiseReady) {
-        const code = await sock.requestPairingCode(number)
-        console.log('\n📲 Pairing Code:', code)
-        console.log('⚡ Enter this in WhatsApp within 2 minutes.\n')
-        return
-      }
-    } catch (err) {
-      console.log('⌛ Waiting for keys to be ready...')
-    }
-
-    await new Promise(res => setTimeout(res, 500))
-    retries++
-  }
-
-  console.error('❌ Timed out waiting for key generation.')
-}
-
 async function startSock() {
   console.log('🚀 Starting WhatsApp socket...')
   const sessionId = generateSessionID()
-  let credentials = {}
-  let keys = {}
+
+  // Use file auth state TEMPORARILY to boot up
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_temp')
 
   const sock = makeWASocket({
-    auth: {
-      creds: credentials,
-      keys: {
-        get: async (type, ids) =>
-          Object.fromEntries(ids.map(id => [id, keys?.[`${type}:${id}`]]).filter(([, v]) => v)),
-        set: async data => {
-          for (const category in data) {
-            for (const id in data[category]) {
-              keys[`${category}:${id}`] = data[category][id]
-            }
-          }
-        }
-      }
-    },
+    auth: state,
+    logger,
+    // show QR if not pairing code mode
     printQRInTerminal: !usePairCode,
-    logger
   })
 
-  sock.ev.on('creds.update', creds => {
-    credentials = creds
-  })
+  sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr && !usePairCode) {
@@ -108,7 +71,13 @@ async function startSock() {
     }
 
     if (usePairCode && connection === 'connecting') {
-      await waitForPairingCode(sock, pairPhoneNumber)
+      try {
+        const code = await sock.requestPairingCode(pairPhoneNumber)
+        console.log('\n📲 Pairing Code:', code)
+        console.log('⚡ Enter this in WhatsApp within 2 minutes.\n')
+      } catch (err) {
+        console.error('❌ Pairing failed:', err.message)
+      }
     }
 
     if (connection === 'close') {
@@ -135,7 +104,7 @@ async function startSock() {
         await sock.sendMessage(jid, { text: `✅ Your Session ID: ${sessionId}` })
         console.log(`📨 Session ID sent to ${jid}`)
 
-        await saveSessionToDB(sessionId, credentials, keys)
+        await saveSessionToDB(sessionId, state.creds, state.keys)
         console.log('🗃️ Session saved to PostgreSQL:', sessionId)
       } catch (err) {
         console.error('❌ Failed to send message or save session:', err.message)
