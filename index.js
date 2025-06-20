@@ -5,25 +5,22 @@ const { Client } = require('pg')
 const crypto = require('crypto')
 const pino = require('pino')
 
-// Parse CLI args
+// CLI args
 const args = process.argv.slice(2)
 const usePairCode = args[0] === 'pair' && args[1]
 const pairPhoneNumber = usePairCode ? args[1] : null
 
-// PostgreSQL config (your Neon DB)
+// PostgreSQL (Neon) connection
 const pgClient = new Client({
   connectionString: 'postgresql://neondb_owner:npg_Nlo0HYIwJD3T@ep-royal-lake-aa8hb1m2-pooler.westus3.azure.neon.tech/neondb?sslmode=require'
 })
 
-// Logger
 const logger = pino({ level: 'silent', transport: { target: 'pino-pretty', options: { colorize: true } } })
 
-// Generate a clean Session ID
 function generateSessionID() {
   return 'IzumieConsole~' + crypto.randomBytes(8).toString('base64url')
 }
 
-// Save session to PostgreSQL
 async function saveSessionToDB(sessionId, creds, keys) {
   try {
     await pgClient.connect()
@@ -51,7 +48,6 @@ async function saveSessionToDB(sessionId, creds, keys) {
   }
 }
 
-// Start WhatsApp socket
 async function startSock() {
   const sessionId = generateSessionID()
   let credentials = {}
@@ -76,42 +72,54 @@ async function startSock() {
     logger
   })
 
+  let pairingRequested = false
+
   sock.ev.on('creds.update', creds => {
     credentials = creds
   })
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    // Show QR (for QR method only)
     if (qr && !usePairCode) {
       console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
     }
 
-    if (usePairCode && connection === 'connecting') {
+    // Pairing code logic (safe)
+    if (
+      usePairCode &&
+      !pairingRequested &&
+      connection === 'connecting' &&
+      sock.authState?.creds?.noiseKey?.public
+    ) {
+      pairingRequested = true
       try {
-        await new Promise(r => setTimeout(r, 3000))
         const code = await sock.requestPairingCode(pairPhoneNumber)
-        console.log('\n📲 Pairing code:', code)
+        console.log('\n📲 Pairing Code:', code)
+        console.log('Enter this on your WhatsApp within 2 mins.\n')
       } catch (err) {
-        console.error('Pairing failed:', err.message)
+        console.error('❌ Pairing failed:', err.message)
       }
     }
 
+    // Handle disconnection
     if (connection === 'close') {
       const reason = lastDisconnect?.error
       if (reason instanceof Boom) {
         const code = reason.output?.statusCode
-        const shouldReconnect =
-          code !== DisconnectReason.badSession &&
-          code !== DisconnectReason.invalidSession
+        const shouldReconnect = usePairCode
+          ? code !== DisconnectReason.badSession && code !== DisconnectReason.invalidSession
+          : code === DisconnectReason.restartRequired
 
         if (shouldReconnect) {
           console.log('🔄 Reconnecting...')
-          setTimeout(startSock, 1000)
+          setTimeout(startSock, 2000)
         } else {
           console.log('❌ Disconnected:', reason.message)
         }
       }
     }
 
+    // Connected!
     if (connection === 'open') {
       console.log('✅ Connected to WhatsApp!')
       try {
@@ -120,7 +128,7 @@ async function startSock() {
         console.log(`Session ID sent to ${jid}`)
 
         await saveSessionToDB(sessionId, credentials, keys)
-        console.log('🗃️ Session saved to Neon DB:', sessionId)
+        console.log('🗃️ Session saved to PostgreSQL:', sessionId)
       } catch (err) {
         console.error('❌ Failed to send message or save session:', err.message)
       }
