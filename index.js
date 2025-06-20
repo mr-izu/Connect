@@ -5,12 +5,12 @@ const { Client } = require('pg')
 const crypto = require('crypto')
 const pino = require('pino')
 
-// Parse CLI args
+// CLI args
 const args = process.argv.slice(2)
 const usePairCode = args[0] === 'pair' && args[1]
 const pairPhoneNumber = usePairCode ? args[1] : null
 
-// PostgreSQL connection (Neon DB)
+// PostgreSQL config
 const pgClient = new Client({
   connectionString: 'postgresql://neondb_owner:npg_Nlo0HYIwJD3T@ep-royal-lake-aa8hb1m2-pooler.westus3.azure.neon.tech/neondb?sslmode=require'
 })
@@ -49,6 +49,30 @@ async function saveSessionToDB(sessionId, creds, keys) {
   }
 }
 
+async function waitForPairingCode(sock, number) {
+  let retries = 0
+  const maxRetries = 10
+
+  while (retries < maxRetries) {
+    try {
+      const noiseReady = sock.authState?.creds?.noiseKey?.public
+      if (noiseReady) {
+        const code = await sock.requestPairingCode(number)
+        console.log('\n📲 Pairing Code:', code)
+        console.log('⚡ Enter this in WhatsApp within 2 minutes.\n')
+        return
+      }
+    } catch (err) {
+      console.log('⌛ Waiting for keys to be ready...')
+    }
+
+    await new Promise(res => setTimeout(res, 500))
+    retries++
+  }
+
+  console.error('❌ Timed out waiting for key generation.')
+}
+
 async function startSock() {
   console.log('🚀 Starting WhatsApp socket...')
   const sessionId = generateSessionID()
@@ -74,8 +98,6 @@ async function startSock() {
     logger
   })
 
-  let pairingRequested = false
-
   sock.ev.on('creds.update', creds => {
     credentials = creds
   })
@@ -85,20 +107,8 @@ async function startSock() {
       console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
     }
 
-    if (
-      usePairCode &&
-      !pairingRequested &&
-      connection === 'connecting' &&
-      sock.authState?.creds?.noiseKey?.public
-    ) {
-      pairingRequested = true
-      try {
-        const code = await sock.requestPairingCode(pairPhoneNumber)
-        console.log('\n📲 Pairing Code:', code)
-        console.log('Enter this code in your WhatsApp (valid for 2 minutes).\n')
-      } catch (err) {
-        console.error('❌ Pairing failed:', err.message)
-      }
+    if (usePairCode && connection === 'connecting') {
+      await waitForPairingCode(sock, pairPhoneNumber)
     }
 
     if (connection === 'close') {
