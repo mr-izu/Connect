@@ -5,12 +5,12 @@ const { Client } = require('pg')
 const crypto = require('crypto')
 const pino = require('pino')
 
-// CLI args
+// Parse CLI args
 const args = process.argv.slice(2)
 const usePairCode = args[0] === 'pair' && args[1]
 const pairPhoneNumber = usePairCode ? args[1] : null
 
-// PostgreSQL (Neon) connection
+// PostgreSQL connection (Neon DB)
 const pgClient = new Client({
   connectionString: 'postgresql://neondb_owner:npg_Nlo0HYIwJD3T@ep-royal-lake-aa8hb1m2-pooler.westus3.azure.neon.tech/neondb?sslmode=require'
 })
@@ -23,6 +23,7 @@ function generateSessionID() {
 
 async function saveSessionToDB(sessionId, creds, keys) {
   try {
+    console.log('🗄️ Connecting to PostgreSQL...')
     await pgClient.connect()
 
     await pgClient.query(`
@@ -49,6 +50,7 @@ async function saveSessionToDB(sessionId, creds, keys) {
 }
 
 async function startSock() {
+  console.log('🚀 Starting WhatsApp socket...')
   const sessionId = generateSessionID()
   let credentials = {}
   let keys = {}
@@ -79,12 +81,10 @@ async function startSock() {
   })
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-    // Show QR (for QR method only)
     if (qr && !usePairCode) {
       console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
     }
 
-    // Pairing code logic (safe)
     if (
       usePairCode &&
       !pairingRequested &&
@@ -95,13 +95,12 @@ async function startSock() {
       try {
         const code = await sock.requestPairingCode(pairPhoneNumber)
         console.log('\n📲 Pairing Code:', code)
-        console.log('Enter this on your WhatsApp within 2 mins.\n')
+        console.log('Enter this code in your WhatsApp (valid for 2 minutes).\n')
       } catch (err) {
         console.error('❌ Pairing failed:', err.message)
       }
     }
 
-    // Handle disconnection
     if (connection === 'close') {
       const reason = lastDisconnect?.error
       if (reason instanceof Boom) {
@@ -112,20 +111,19 @@ async function startSock() {
 
         if (shouldReconnect) {
           console.log('🔄 Reconnecting...')
-          setTimeout(startSock, 2000)
+          setTimeout(() => startSock().catch(console.error), 2000)
         } else {
           console.log('❌ Disconnected:', reason.message)
         }
       }
     }
 
-    // Connected!
     if (connection === 'open') {
       console.log('✅ Connected to WhatsApp!')
       try {
         const jid = usePairCode ? pairPhoneNumber.replace(/\D/g, '') + '@s.whatsapp.net' : sock.user.id
         await sock.sendMessage(jid, { text: `✅ Your Session ID: ${sessionId}` })
-        console.log(`Session ID sent to ${jid}`)
+        console.log(`📨 Session ID sent to ${jid}`)
 
         await saveSessionToDB(sessionId, credentials, keys)
         console.log('🗃️ Session saved to PostgreSQL:', sessionId)
@@ -136,13 +134,13 @@ async function startSock() {
   })
 }
 
-// Start logic
+// Run
 if (usePairCode) {
   if (!/^\d{10,15}$/.test(pairPhoneNumber)) {
     console.error('❌ Invalid phone number format')
     process.exit(1)
   }
-  startSock()
+  startSock().catch(console.error)
 } else {
-  startSock()
+  startSock().catch(console.error)
 }
