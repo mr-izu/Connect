@@ -1,28 +1,33 @@
 const {
   makeWASocket,
   useMultiFileAuthState,
-  DisconnectReason
+  DisconnectReason,
+  Browsers
 } = require('@whiskeysockets/baileys')
 const QRCode = require('qrcode')
 const { Boom } = require('@hapi/boom')
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
+const { Client } = require('pg')
 const pino = require('pino')
 
-// Parse CLI arguments
+// PostgreSQL setup (Neon)
+const pgClient = new Client({
+  connectionString: 'postgresql://neondb_owner:npg_Nlo0HYIwJD3T@ep-royal-lake-aa8hb1m2-pooler.westus3.azure.neon.tech/neondb?sslmode=require'
+})
+
+pgClient.connect().catch(err => {
+  console.error('❌ Failed to connect to PostgreSQL:', err.message)
+})
+
+// Parse command-line arguments
 const args = process.argv.slice(2)
 const usePairCode = args[0] === 'pair' && args[1]
 const pairPhoneNumber = usePairCode ? args[1] : null
-
-const AUTH_DIR = './auth_info_baileys'
 let globalPairingRequested = false
 
-// Clean up old auth state if pairing
-if (usePairCode && fs.existsSync(AUTH_DIR)) {
-  fs.rmSync(AUTH_DIR, { recursive: true, force: true })
-}
-
-// Logger setup
+// Logger
 const logger = pino({
   level: 'silent',
   transport: {
@@ -31,125 +36,111 @@ const logger = pino({
   }
 })
 
+// Generate session ID
+function generateSessionID() {
+  return 'IzumieConsole~' + crypto.randomBytes(8).toString('base64url')
+}
+
+// Save creds to DB, then clear local
+async function handleCreds(sessionId, credsPath) {
+  try {
+    const rawCreds = fs.readFileSync(credsPath, 'utf-8')
+    await pgClient.query(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        data JSONB NOT NULL
+      );
+    `)
+    await pgClient.query(
+      `INSERT INTO sessions (id, data) VALUES ($1, $2)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data`,
+      [sessionId, JSON.parse(rawCreds)]
+    )
+    fs.rmSync(path.dirname(credsPath), { recursive: true, force: true }) // delete folder
+    return true
+  } catch (err) {
+    console.error('❌ Failed saving session:', err.message)
+    return false
+  }
+}
+
 async function startSock() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+  const sessionId = generateSessionID()
+  const { state, saveCreds } = await useMultiFileAuthState('./auth_temp')
 
   const sock = makeWASocket({
     auth: state,
+    logger,
     printQRInTerminal: !usePairCode,
-    logger
+    browser: Browsers.macOS('Google Chrome')
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
-
-    // Show QR code in terminal
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr && !usePairCode) {
-      console.log('📸 Scan this QR code with WhatsApp:')
       console.log(await QRCode.toString(qr, { type: 'terminal', small: true }))
     }
 
-    // Pairing flow
-    if (
-      usePairCode &&
-      !globalPairingRequested &&
-      (connection === 'connecting' || qr)
-    ) {
+    if (usePairCode && !globalPairingRequested && (connection === 'connecting' || qr)) {
       globalPairingRequested = true
+      await new Promise(r => setTimeout(r, 3000))
       try {
-        await new Promise(r => setTimeout(r, 3000))
         const code = await sock.requestPairingCode(pairPhoneNumber)
-        console.log('\n📲 Pairing code for', pairPhoneNumber, ':', code)
-        console.log('⚡ Enter this code in WhatsApp within 2 minutes.\n')
+        console.log(`\n📲 Pairing code: ${code}`)
       } catch (err) {
         console.error('❌ Pairing failed:', err.message)
       }
     }
 
-    // Disconnect logic
+    if (connection === 'open') {
+      console.log('✅ Connected to WhatsApp!')
+
+      const credsPath = path.join('./auth_temp', 'creds.json')
+      const success = await handleCreds(sessionId, credsPath)
+
+      const jid = usePairCode
+        ? pairPhoneNumber.replace(/\D/g, '') + '@s.whatsapp.net'
+        : sock.user.id
+
+      try {
+        await sock.sendMessage(jid, {
+          text: success
+            ? `✅ Connected Successfully!\n🗝️ Session ID: ${sessionId}`
+            : `⚠️ Connected but failed to store session.`
+        })
+        console.log('📨 Session ID sent.')
+      } catch (err) {
+        console.error('❌ Failed to send session message:', err.message)
+      }
+    }
+
     if (connection === 'close') {
       const reason = lastDisconnect?.error
       let shouldReconnect = false
 
       if (reason instanceof Boom) {
-        const statusCode = reason.output?.statusCode
+        const status = reason.output?.statusCode
+        shouldReconnect = usePairCode
+          ? status !== DisconnectReason.badSession && status !== DisconnectReason.invalidSession
+          : status === DisconnectReason.restartRequired
 
-        if (usePairCode) {
-          shouldReconnect = statusCode !== DisconnectReason.badSession &&
-                            statusCode !== DisconnectReason.invalidSession
-          if (statusCode === DisconnectReason.unauthorized) {
-            console.log('⏳ Waiting for pairing confirmation...')
-          }
-        } else {
-          shouldReconnect = statusCode === DisconnectReason.restartRequired
+        if (!shouldReconnect) {
+          console.log('❌ Disconnected:', reason.message)
         }
       }
 
       if (shouldReconnect) {
         console.log('🔄 Reconnecting...')
-        setTimeout(startSock, 2000)
-      } else {
-        console.log('❌ Connection closed:', reason?.output?.payload || reason || 'unknown')
-      }
-    }
-
-    // Successful connection
-    if (connection === 'open') {
-      console.log('✅ Successfully connected to WhatsApp!')
-
-      try {
-        const jid = usePairCode
-          ? pairPhoneNumber.replace(/\D/g, '') + '@s.whatsapp.net'
-          : sock.user.id
-
-        // 1. Send "Connected Successfully" message
-        await sock.sendMessage(jid, { text: '✅ Connected Successfully!' })
-        console.log('📨 Sent confirmation to', jid)
-
-        // 2. Read and send session JSON
-        const credsPath = path.join(AUTH_DIR, 'creds.json')
-        const keysPath = path.join(AUTH_DIR, 'keys')
-
-        if (fs.existsSync(credsPath)) {
-          const credsJson = fs.readFileSync(credsPath, 'utf-8')
-          await sock.sendMessage(jid, {
-            text: `🗝️ Session creds:\n\`\`\`${credsJson}\`\`\``
-          })
-        }
-
-        if (fs.existsSync(keysPath)) {
-          const keyFiles = fs.readdirSync(keysPath)
-          for (const file of keyFiles) {
-            const filePath = path.join(keysPath, file)
-            const keyData = fs.readFileSync(filePath, 'utf-8')
-            await sock.sendMessage(jid, {
-              text: `🔐 ${file}:\n\`\`\`${keyData}\`\`\``
-            })
-          }
-        }
-
-        // 3. Delete session from local storage
-        if (fs.existsSync(AUTH_DIR)) {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true })
-          console.log('🧹 Cleared local session storage.')
-        }
-
-      } catch (err) {
-        console.error('❌ Failed to send session or message:', err.message)
+        setTimeout(() => startSock().catch(console.error), 2000)
       }
     }
   })
 }
 
-// Entry point
-if (usePairCode) {
-  if (!pairPhoneNumber || !/^\d{10,15}$/.test(pairPhoneNumber)) {
-    console.error('❌ Invalid phone number. Must be 10-15 digits, no +')
-    process.exit(1)
-  }
-  startSock()
-} else {
-  startSock()
+// Validate and start
+if (usePairCode && !/^\d{10,15}$/.test(pairPhoneNumber)) {
+  console.error('❌ Invalid phone number. Must be E.164 format without "+"')
+  process.exit(1)
 }
+startSock().catch(console.error)
