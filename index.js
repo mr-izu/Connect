@@ -15,7 +15,7 @@ let globalPairingRequested = false
 
 // Setup PostgreSQL client
 const pgClient = new Client({
-  connectionString: process.env.DATABASE_URL || 'postgres://user:password@localhost:5432/yourdb'
+  connectionString: process.env.DATABASE_URL || 'postgresql://neondb_owner:npg_Nlo0HYIwJD3T@ep-royal-lake-aa8hb1m2-pooler.westus3.azure.neon.tech/neondb?sslmode=require'
 })
 pgClient.connect()
 
